@@ -1,0 +1,28 @@
+# 备份与归档
+*.bak
+*.bak.*
+*.tar.gz
+*.zip
+
+# 运行期产物（不应进仓库）
+*.log
+*.pid
+*.db
+*.db-wal
+*.db-shm
+
+# 凭据（任何情况下都不要提交）
+.nezha_pat
+*token*
+*.pem
+*.key
+*.cer
+
+# 编辑器与系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# 本地工具配置
+.claude/
