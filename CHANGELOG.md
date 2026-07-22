@@ -4,6 +4,46 @@
 
 ---
 
+## [1.0.4] - 2026-07-22
+
+面向「纯监控」场景的加固：面板只用于看状态，不需要网页终端、文件管理与 NAT 穿透。
+
+### 变更
+
+- **Nginx 屏蔽网页终端与文件管理的全部入口**
+
+  原配置只拦了 `^/api/v1/ws/terminal` 一条。实测发现两处缺口：
+
+  1. 终端的**创建会话**接口 `POST /api/v1/terminal` 未拦（只拦 websocket 时该接口仍可调用）
+  2. 文件管理器**完全放行** —— `POST /api/v1/file` 与 `GET /api/v1/ws/file/:id` 均可用，且 WebSocket 白名单 `^/api/v1/ws/(server|file)` 明确将 `file` 列入允许。文件管理器可读写删任意文件，与终端属同级风险
+
+  现按面板 v2.3.0 `cmd/dashboard/controller/controller.go` 的实际注册路由，将四条全部返回 403，并将 WebSocket 白名单收窄为 `server`：
+
+  | 功能 | 创建会话 | WebSocket |
+  | --- | --- | --- |
+  | 终端 | `POST /api/v1/terminal` | `GET /api/v1/ws/terminal/:id` |
+  | 文件管理 | `POST /api/v1/file` | `GET /api/v1/ws/file/:id` |
+
+  该屏蔽与服务器数量无关，新增机器自动生效，无需逐台配置。
+
+- **新增菜单 13：生成 Agent 安装命令**
+
+  从面板配置读取 `install_host`、`tls` 与 `users.agent_secret`，生成新增服务器用的安装命令，并默认追加两个加固开关：
+
+  - `disable_command_execute: true` —— 关闭网页终端、文件管理、命令执行、文件传输与 MCP 处理器
+  - `disable_nat: true` —— 关闭 NAT 穿透。这是**独立开关**，`disable_command_execute` 管不到（见 agent v2.3.0 `cmd/agent/nat_session.go`），此前容易遗漏
+
+### 已知边界
+
+Nginx 层只能拦住 HTTP 入口，以下两项需在 agent 侧或面板内解决，已在菜单 13 的提示中说明：
+
+- **NAT 穿透**：隧道任务经 gRPC 下发，不走被拦的 HTTP 路由，Nginx 拦不住，只能靠 agent 的 `disable_nat`
+- **DDNS**：为面板内部功能，执行不经 HTTP 接口；不配置 DDNS 配置文件即不会生效
+
+另需注意，`disable_command_execute` 置为 `true` 后，面板下发的 agent 配置修改同样会被拒绝，之后调整该机器的 agent 配置只能通过 SSH。
+
+---
+
 ## [1.0.3] - 2026-07-22
 
 ### 变更

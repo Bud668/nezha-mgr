@@ -8,7 +8,7 @@
 # ==============================================================
 
 # 脚本版本（唯一来源，其余位置一律引用此变量，勿再硬编码）
-SCRIPT_VERSION="1.0.3"
+SCRIPT_VERSION="1.0.4"
 
 # 颜色定义
 RED='\033[0;31m'
@@ -839,14 +839,21 @@ http {
             error_page 502 503 504 /grpc_error.html;
         }
 
-        # -------- 禁止网页终端 SSH (安全加固) --------
-        location ~* ^/api/v1/ws/terminal {
+        # -------- 纯监控加固：屏蔽网页终端与文件管理 --------
+        # 两者各有「创建会话」和「websocket」两跳，必须都拦：只拦 ws 的话，
+        # POST /api/v1/terminal 与 POST /api/v1/file 仍可被直接调用。
+        # 路由取自面板 v2.3.0 cmd/dashboard/controller/controller.go。
+        location ~* ^/api/v1/(terminal|file)(/|\$) {
+            return 403;
+            access_log off;
+        }
+        location ~* ^/api/v1/ws/(terminal|file)(/|\$) {
             return 403;
             access_log off;
         }
 
-        # -------- WebSocket 连接 (仅允许 server 和 file) --------
-        location ~* ^/api/v1/ws/(server|file)(.*)\$ {
+        # -------- WebSocket 连接 (仅允许 server) --------
+        location ~* ^/api/v1/ws/(server)(.*)\$ {
             limit_req zone=nezha_ws burst=50 nodelay;
             
             proxy_pass http://nezha_dashboard;
@@ -4075,6 +4082,48 @@ manage_update() {
 # ==============================================================
 # 菜单
 # ==============================================================
+# 生成新增服务器的 agent 安装命令，默认带上纯监控加固。
+# 两个开关缺一不可：disable_command_execute 管终端/文件管理/命令执行/MCP，
+# NAT 穿透走的是独立的 disable_nat（见 agent v2.3.0 cmd/agent/nat_session.go）。
+show_agent_install_cmd() {
+    local install_host agent_secret tls_val nz_tls
+    install_host=$(grep '^install_host:' "${INSTALL_DIR}/data/config.yaml" 2>/dev/null | awk '{print $2}')
+    tls_val=$(grep '^tls:'          "${INSTALL_DIR}/data/config.yaml" 2>/dev/null | awk '{print $2}')
+    agent_secret=$(sqlite3 "${INSTALL_DIR}/data/sqlite.db" \
+        "select agent_secret from users where role=0 order by id limit 1;" 2>/dev/null)
+
+    if [ -z "$install_host" ] || [ -z "$agent_secret" ]; then
+        echo -e "${RED}读取面板配置失败：请确认面板已安装，且 ${INSTALL_DIR}/data 下的 config.yaml 与 sqlite.db 可读${PLAIN}"
+        press_any_key
+        return
+    fi
+    if [ "$tls_val" = "true" ]; then nz_tls="true"; else nz_tls="false"; fi
+
+    clear
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${PLAIN}"
+    echo -e "${CYAN}║${PLAIN}${BLUE}              新增服务器 Agent 安装命令                ${CYAN}║${PLAIN}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${PLAIN}"
+    echo
+    echo -e "${GREEN}在新服务器上执行以下命令（已默认关闭网页终端 / 文件管理 / NAT 穿透）：${PLAIN}"
+    echo
+    cat <<CMDEOF
+curl -L https://raw.githubusercontent.com/nezhahq/scripts/main/agent/install.sh -o agent.sh && chmod +x agent.sh && \\
+env NZ_SERVER=${install_host} NZ_TLS=${nz_tls} NZ_CLIENT_SECRET=${agent_secret} ./agent.sh && \\
+sleep 2 && \\
+sed -i -E 's/^([[:space:]]*disable_command_execute:).*/\1 true/; s/^([[:space:]]*disable_nat:).*/\1 true/' /opt/nezha/agent/config.yml && \\
+systemctl restart nezha-agent && \\
+( grep -q "disable_command_execute: true" /opt/nezha/agent/config.yml && grep -q "disable_nat: true" /opt/nezha/agent/config.yml && echo "✅ 网页终端 / 文件管理 / NAT 穿透 均已禁用" || echo "⚠️ 加固失败，请手动检查 /opt/nezha/agent/config.yml" )
+CMDEOF
+    echo
+    echo -e "${YELLOW}说明：${PLAIN}"
+    echo -e "  ${CYAN}·${PLAIN} 加固写在 agent 侧，即使面板被攻破也拦得住"
+    echo -e "  ${CYAN}·${PLAIN} 面板 Nginx 已同时屏蔽终端与文件管理的 HTTP 入口，两者互为兜底"
+    echo -e "  ${CYAN}·${PLAIN} ${RED}单向门${PLAIN}：disable_command_execute 置 true 后，面板下发的配置修改也会被 agent 拒绝，"
+    echo -e "    之后再改该机器的 agent 配置只能 SSH 上去改"
+    echo
+    press_any_key
+}
+
 menu() {
     clear
     get_service_status
@@ -4105,6 +4154,7 @@ menu() {
     echo -e "${CYAN}║${PLAIN}   10. 查看实时日志                                   ${CYAN}║${PLAIN}"
     echo -e "${CYAN}║${PLAIN}   11. 同步界面美化代码                               ${CYAN}║${PLAIN}"
     echo -e "${CYAN}║${PLAIN}   12. 配置 TG 管理 Bot                               ${CYAN}║${PLAIN}"
+    echo -e "${CYAN}║${PLAIN}   13. 生成 Agent 安装命令 (默认关终端/文件/NAT)      ${CYAN}║${PLAIN}"
     echo -e "${CYAN}║${PLAIN}   0.  退出                                           ${CYAN}║${PLAIN}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${PLAIN}"
     read -p " 请输入选项: " num
@@ -4160,12 +4210,15 @@ menu() {
         12)
             manage_bot
             ;;
+        13)
+            show_agent_install_cmd
+            ;;
         0)
             echo -e "${GREEN}再见!${PLAIN}"
             exit 0
             ;;
         *)
-            echo -e "${RED}请输入正确数字 [0-12]${PLAIN}"
+            echo -e "${RED}请输入正确数字 [0-13]${PLAIN}"
             sleep 1
             ;;
     esac
