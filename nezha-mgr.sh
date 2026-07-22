@@ -8,7 +8,7 @@
 # ==============================================================
 
 # 脚本版本（唯一来源，其余位置一律引用此变量，勿再硬编码）
-SCRIPT_VERSION="1.0.4"
+SCRIPT_VERSION="1.1.0"
 
 # 颜色定义
 RED='\033[0;31m'
@@ -2017,6 +2017,7 @@ from datetime import datetime, timezone, timedelta
 # ============ 配置 ============
 TG_BOT_TOKEN      = "请填写"
 TG_CHAT_ID        = "请填写"
+TG_THREAD_ID      = ""    # 话题群的 message_thread_id，空 = 普通群/主话题
 CPU_THRESHOLD     = 90    # CPU 告警阈值 %
 MEM_THRESHOLD     = 90    # 内存告警阈值 %
 DISK_THRESHOLD    = 90    # 磁盘告警阈值 %
@@ -2127,11 +2128,10 @@ class TGError(RuntimeError):
 
 def send_tg(message):
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    payload = json.dumps({
-        "chat_id": TG_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML"
-    }).encode()
+    body = {"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "HTML"}
+    if TG_THREAD_ID:
+        body["message_thread_id"] = int(TG_THREAD_ID)
+    payload = json.dumps(body).encode()
     req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -2415,7 +2415,7 @@ EOF
     # 健康脚本每 CHECK_INTERVAL 秒写一行心跳，不轮转会无限增长（实测两个月 40MB/89 万行）。
     # 各服务用 StandardOutput=append: 持有 fd，必须用 copytruncate，否则轮转后仍写旧文件。
     cat > /etc/logrotate.d/nezha << 'EOF'
-/var/log/nezha_health.log /var/log/nezha_notify.log /var/log/nezha_bot.log /var/log/nezha_upgrade.log {
+/var/log/nezha_health.log /var/log/nezha_notify.log /var/log/nezha_bot.log /var/log/nezha_upgrade.log /var/log/nezha_audit.log {
     size 20M
     rotate 7
     compress
@@ -2677,6 +2677,7 @@ DB_PATH      = "/opt/nezha/data/sqlite.db"
 STATE_PATH   = "/opt/nezha/notify_state.json"
 TG_BOT_TOKEN = "请填写"
 TG_CHAT_ID   = "请填写"
+TG_THREAD_ID = ""    # 话题群的 message_thread_id，空 = 普通群/主话题
 # ==============================
 
 CST = timezone(timedelta(hours=8))
@@ -2849,6 +2850,8 @@ def send_tg(message, sbtns=None):
     # sbtns: [(emoji, id, name, cc)]，每个生成一个 askdate 按钮(bot 私聊引导设日期)，每行2个，最多20个
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     body = {"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "HTML"}
+    if TG_THREAD_ID:
+        body["message_thread_id"] = int(TG_THREAD_ID)
     rows = []
     if sbtns:
         rb = [{"text": f"{e} {_flag(cc)}{nm}".strip(), "callback_data": f"askdate:{sid}"}
@@ -3149,7 +3152,353 @@ TMREOF
 }
 
 # ==============================================================
-# 模块 12: 新版本检测推送 (复用健康告警的 Telegram 配置)
+# 模块 12: Agent 加固巡检 (盯住漏加固的机器，复用 bot 的读写 PAT)
+# ==============================================================
+AUDIT_SCRIPT="/opt/nezha/nezha_audit.py"
+AUDIT_SERVICE="/etc/systemd/system/nezha-audit.service"
+AUDIT_TIMER="/etc/systemd/system/nezha-audit.timer"
+
+deploy_audit_script() {
+    cat > "$AUDIT_SCRIPT" << 'PYEOF'
+#!/usr/bin/env python3
+# Agent 加固巡检 - 探测各 agent 的 disable_command_execute / disable_nat，发现未加固则推 TG
+#
+# 探测原理：GET /api/v1/server/config/{id} 会向 agent 下发 ReportConfig 任务。
+#   · agent 已设 disable_command_execute=true → 连回报配置都拒绝，接口返回
+#     success=false + "此 Agent 已禁止命令执行" —— 这个拒绝本身就是「已加固」的证据
+#   · 未加固 → 返回完整配置 JSON，可读到两个开关的真实值
+# 因此本巡检只能查出「CE 未关」的机器；CE 已关的机器其 disable_nat 无法远程读取。
+
+import json, time, urllib.request, urllib.error
+from datetime import datetime, timezone, timedelta
+
+# ============ 配置 ============
+TG_BOT_TOKEN  = "请填写"
+TG_CHAT_ID    = "请填写"
+TG_THREAD_ID  = ""        # 话题群的 message_thread_id，空 = 普通群/主话题
+NEZHA_HOST    = "127.0.0.1"
+NEZHA_PORT    = 8008
+READ_PAT_FILE = "/opt/nezha/.nezha_pat"       # 只读 PAT，用于拉服务器列表
+CFG_PAT_FILE  = "/opt/nezha/.nezha_bot_pat"   # 含 server:write 的 PAT，读配置需要
+STATE_FILE    = "/opt/nezha/nezha_audit_state.json"
+OFFLINE_SECS  = 30        # 超过多少秒未上报视为离线（离线机器一律跳过，见下）
+PROBE_GAP     = 0.5       # 每台之间的间隔秒数，避免一次性给所有 agent 下发任务
+# ==============================
+
+CST = timezone(timedelta(hours=8))
+
+
+def _pat(path):
+    with open(path) as f:
+        t = f.read().strip()
+    if not t:
+        raise RuntimeError("PAT 为空: %s" % path)
+    return t
+
+
+def _get(url, pat, timeout=25):
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + pat})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
+def parse_last_active(ts_str):
+    if not ts_str:
+        return 0
+    try:
+        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        return 0 if dt.year <= 1 else dt.timestamp()
+    except Exception:
+        return 0
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def send_tg(message):
+    body = {"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "HTML"}
+    if TG_THREAD_ID:
+        body["message_thread_id"] = int(TG_THREAD_ID)
+    req = urllib.request.Request(
+        "https://api.telegram.org/bot%s/sendMessage" % TG_BOT_TOKEN,
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        r = json.loads(resp.read())
+    if not r.get("ok"):
+        raise RuntimeError("TG send failed: %s" % r)
+
+
+def audit():
+    base = "http://%s:%d" % (NEZHA_HOST, NEZHA_PORT)
+    now_ts = time.time()
+    servers = (_get(base + "/api/v1/server", _pat(READ_PAT_FILE)).get("data") or [])
+    cfg_pat = _pat(CFG_PAT_FILE)
+
+    weak, hardened, skipped = {}, [], []
+    for s in sorted(servers, key=lambda x: x.get("id", 0)):
+        sid, name = s.get("id"), s.get("name", "unknown")
+        # 离线机器必须跳过：面板的 ConfigCache 会把上一次的配置直接返回，
+        # 拿到的是快照而非实时值，据此告警等于凭空捏造。
+        la = parse_last_active(s.get("last_active", ""))
+        if not la or (now_ts - la) >= OFFLINE_SECS:
+            skipped.append(name)
+            continue
+        try:
+            d = _get(base + "/api/v1/server/config/%d" % sid, cfg_pat)
+        except Exception:
+            skipped.append(name)
+            continue
+        if not d.get("success"):
+            if "禁止命令执行" in (d.get("error") or ""):
+                hardened.append(name)      # 拒绝回报 = CE 已关
+            else:
+                skipped.append(name)
+            continue
+        try:
+            # 返回体含 client_secret 等凭据，只取两个布尔量，其余一律不留存不外发
+            c = json.loads(d.get("data") or "{}")
+        except Exception:
+            skipped.append(name)
+            continue
+        off = [k for k in ("disable_command_execute", "disable_nat") if not c.get(k)]
+        if off:
+            weak[name] = off
+        else:
+            hardened.append(name)
+        time.sleep(PROBE_GAP)
+
+    return weak, hardened, skipped
+
+
+def main():
+    import sys
+    force = "--force" in sys.argv
+    ts = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        weak, hardened, skipped = audit()
+    except Exception as e:
+        print("[%s] 巡检失败: %s" % (ts, e))
+        return
+
+    prev = set(load_state().get("weak", []))
+    cur = set(weak)
+    print("[%s] 未加固 %d / 已加固 %d / 跳过 %d"
+          % (ts, len(cur), len(hardened), len(skipped)))
+
+    # 仅在名单发生变化时推送，避免同一批机器天天刷屏
+    if cur == prev and not force:
+        try:
+            with open(STATE_FILE, "w") as f:
+                json.dump({"weak": sorted(cur), "ts": ts}, f)
+        except Exception:
+            pass
+        print("[%s] 名单无变化，不推送" % ts)
+        return
+
+    lines = []
+    if cur:
+        lines.append("🔒 <b>Agent 加固巡检</b>（%s）" % ts)
+        lines.append("发现 <b>%d</b> 台未加固：" % len(cur))
+        for n in sorted(cur):
+            miss = "、".join("命令执行/终端/文件管理" if k == "disable_command_execute"
+                             else "NAT 穿透" for k in weak[n])
+            lines.append("  · <b>#%s</b> —— 未关闭：%s" % (n, miss))
+        lines.append("")
+        lines.append("处理：在该机器执行菜单 13 生成的安装命令尾部那段 sed，或手动改")
+        lines.append("<code>/opt/nezha/agent/config.yml</code> 后重启 nezha-agent")
+    else:
+        lines.append("✅ <b>Agent 加固巡检</b>（%s）" % ts)
+        lines.append("此前未加固的机器已全部处理完毕")
+    if skipped:
+        lines.append("")
+        lines.append("ℹ️ 离线/探测失败已跳过 %d 台：%s" % (len(skipped), "、".join(sorted(skipped)[:10])))
+
+    try:
+        send_tg("\n".join(lines))
+        print("[%s] 已推送" % ts)
+    except Exception as e:
+        print("[%s] 推送失败(状态不落盘，下次重试): %s" % (ts, e))
+        return
+
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump({"weak": sorted(cur), "ts": ts}, f)
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+    chmod +x "$AUDIT_SCRIPT"
+}
+
+_audit_timer_install() {
+    cat > "$AUDIT_SERVICE" << EOF
+[Unit]
+Description=Nezha Agent Hardening Audit
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -u ${AUDIT_SCRIPT}
+StandardOutput=append:/var/log/nezha_audit.log
+StandardError=append:/var/log/nezha_audit.log
+EOF
+    cat > "$AUDIT_TIMER" << 'EOF'
+[Unit]
+Description=Nezha Agent Hardening Audit Timer
+
+[Timer]
+OnCalendar=*-*-* 09:30:00 Asia/Shanghai
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now nezha-audit.timer >/dev/null 2>&1
+}
+
+# 写入 python/shell 配置文件里的 KEY = "value"，保留原有对齐与行尾注释
+# $1=文件 $2=键名 $3=新值
+_tg_set() {
+    [ -f "$1" ] || return 0
+    sed -i -E "s|^(${2}[[:space:]]*=[[:space:]]*)\"[^\"]*\"|\1\"${3}\"|" "$1"
+}
+
+manage_audit() {
+    [ -f "$AUDIT_SCRIPT" ] || deploy_audit_script
+    while true; do
+        clear
+        local tstat weak last
+        if systemctl is-enabled --quiet nezha-audit.timer 2>/dev/null; then
+            tstat="${GREEN}已开启${PLAIN}"
+        else
+            tstat="${RED}已关闭${PLAIN}"
+        fi
+        weak=$(python3 -c "import json;d=json.load(open('/opt/nezha/nezha_audit_state.json'));print('、'.join(d.get('weak') or []) or '无')" 2>/dev/null || echo "尚未巡检")
+        last=$(python3 -c "import json;print(json.load(open('/opt/nezha/nezha_audit_state.json')).get('ts','-'))" 2>/dev/null || echo "-")
+        echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${PLAIN}"
+        echo -e "${CYAN}║${PLAIN}${BLUE}                 Agent 加固巡检                       ${CYAN}║${PLAIN}"
+        echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${PLAIN}"
+        echo -e "${CYAN}║${PLAIN}  定时巡检 : ${tstat}   (每天 09:30)"
+        echo -e "${CYAN}║${PLAIN}  上次巡检 : ${last}"
+        echo -e "${CYAN}║${PLAIN}  未加固   : ${weak}"
+        echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${PLAIN}"
+        echo -e "${CYAN}║${PLAIN}   1.  立即巡检一次 (强制推送结果)                    ${CYAN}║${PLAIN}"
+        echo -e "${CYAN}║${PLAIN}   2.  开启 / 关闭定时巡检                            ${CYAN}║${PLAIN}"
+        echo -e "${CYAN}║${PLAIN}   0.  返回主菜单                                     ${CYAN}║${PLAIN}"
+        echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${PLAIN}"
+        read -p " 请输入选项: " a
+        case "$a" in
+            1)
+                echo -e "${CYAN}巡检中（离线机器会跳过，避免面板缓存导致误判）...${PLAIN}"
+                python3 "$AUDIT_SCRIPT" --force
+                press_any_key
+                ;;
+            2)
+                if systemctl is-enabled --quiet nezha-audit.timer 2>/dev/null; then
+                    systemctl disable --now nezha-audit.timer >/dev/null 2>&1
+                    echo -e "${YELLOW}定时巡检已关闭${PLAIN}"
+                else
+                    _audit_timer_install
+                    echo -e "${GREEN}定时巡检已开启（每天 09:30）${PLAIN}"
+                fi
+                sleep 1
+                ;;
+            0) return ;;
+            *) echo -e "${RED}无效选项${PLAIN}"; sleep 1 ;;
+        esac
+    done
+}
+
+# 统一配置话题群：5 个通道共用一个群，各占一个话题
+manage_tg_topics() {
+    clear
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${PLAIN}"
+    echo -e "${CYAN}║${PLAIN}${BLUE}                 TG 群组话题配置                      ${CYAN}║${PLAIN}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${PLAIN}"
+    echo
+    echo -e "${YELLOW}前置条件：群已开启「话题」模式，bot 已是管理员且有管理话题权限${PLAIN}"
+    echo -e "${CYAN}话题 ID = 在 TG 里右键话题「复制链接」，末尾那个数字${PLAIN}"
+    echo -e "${CYAN}留空 = 该通道不使用话题，消息发到群主区${PLAIN}"
+    echo
+
+    local cur_token cur_chat
+    cur_token=$(grep -m1 '^TG_BOT_TOKEN' "$HEALTH_SCRIPT" 2>/dev/null | sed 's/.*= *"//;s/".*//')
+    cur_chat=$(grep -m1 '^TG_CHAT_ID' "$HEALTH_SCRIPT" 2>/dev/null | sed 's/.*= *"//;s/".*//')
+
+    read -p "Bot Token [当前 ${cur_token:0:12}...]: " tok; tok=${tok:-$cur_token}
+    read -p "话题群 Chat ID [当前 ${cur_chat}]: " chat; chat=${chat:-$cur_chat}
+    if [ -z "$tok" ] || [ "$tok" = "请填写" ] || [ -z "$chat" ]; then
+        echo -e "${RED}Token / Chat ID 不能为空${PLAIN}"; press_any_key; return
+    fi
+    read -p "话题ID - 监控告警 (离线/资源): " th_mon
+    read -p "话题ID - 到期提醒            : " th_exp
+    read -p "话题ID - 面板升级            : " th_upd
+    read -p "话题ID - Agent 巡检          : " th_aud
+
+    [ -f "$AUDIT_SCRIPT" ] || deploy_audit_script
+
+    _tg_set "$HEALTH_SCRIPT" TG_BOT_TOKEN "$tok"
+    _tg_set "$HEALTH_SCRIPT" TG_CHAT_ID   "$chat"
+    _tg_set "$HEALTH_SCRIPT" TG_THREAD_ID "$th_mon"
+    _tg_set "$NOTIFY_SCRIPT" TG_BOT_TOKEN "$tok"
+    _tg_set "$NOTIFY_SCRIPT" TG_CHAT_ID   "$chat"
+    _tg_set "$NOTIFY_SCRIPT" TG_THREAD_ID "$th_exp"
+    _tg_set "$AUDIT_SCRIPT"  TG_BOT_TOKEN "$tok"
+    _tg_set "$AUDIT_SCRIPT"  TG_CHAT_ID   "$chat"
+    _tg_set "$AUDIT_SCRIPT"  TG_THREAD_ID "$th_aud"
+    _tg_set "$BOT_SCRIPT"    TG_BOT_TOKEN "$tok"
+    # 升级脚本每次部署都会重写，先确保它存在再写话题；它的 token/chat 仍从健康脚本读
+    [ -f "$UPGRADE_SCRIPT" ] && _tg_set "$UPGRADE_SCRIPT" TG_THREAD_ID "$th_upd"
+
+    echo
+    echo -e "${CYAN}正在逐通道发送验证消息（当场暴露话题 ID 填错）...${PLAIN}"
+    local ok=0 fail=0
+    for pair in "监控告警:$th_mon" "到期提醒:$th_exp" "面板升级:$th_upd" "Agent巡检:$th_aud"; do
+        local label="${pair%%:*}" tid="${pair##*:}"
+        if python3 - "$tok" "$chat" "$tid" "$label" <<'PY'
+import json, sys, urllib.request
+tok, chat, tid, label = sys.argv[1:5]
+body = {"chat_id": chat, "text": "【通道验证】%s 已接通" % label}
+if tid:
+    body["message_thread_id"] = int(tid)
+req = urllib.request.Request("https://api.telegram.org/bot%s/sendMessage" % tok,
+                             data=json.dumps(body).encode(),
+                             headers={"Content-Type": "application/json"})
+try:
+    with urllib.request.urlopen(req, timeout=15) as r:
+        sys.exit(0 if json.loads(r.read()).get("ok") else 1)
+except Exception:
+    sys.exit(1)
+PY
+        then
+            echo -e "  ${GREEN}✓${PLAIN} ${label} ${tid:+(话题 ${tid})}"; ok=$((ok+1))
+        else
+            echo -e "  ${RED}✗${PLAIN} ${label} ${tid:+(话题 ${tid})} —— 检查话题 ID 或 bot 权限"; fail=$((fail+1))
+        fi
+    done
+    echo
+    echo -e "${CYAN}成功 ${ok} / 失败 ${fail}${PLAIN}"
+    echo -e "${YELLOW}提示：TG Bot 的回复会自动跟随你所在的话题，无需单独配置${PLAIN}"
+    systemctl restart nezha-health 2>/dev/null
+    systemctl restart nezha-bot 2>/dev/null
+    echo -e "${GREEN}配置已保存，相关服务已重启${PLAIN}"
+    press_any_key
+}
+
+# ==============================================================
+# 模块 13: 新版本检测推送 (复用健康告警的 Telegram 配置)
 # ==============================================================
 UPGRADE_SCRIPT="/opt/nezha/nezha_upgrade.sh"
 
@@ -3456,8 +3805,15 @@ def edit(chat_id, mid, text, markup):
        text=text, parse_mode="HTML", reply_markup=markup)
 
 
+# 当前正在处理的更新所在话题；回复时原样带回，消息才会落在用户说话的那个话题里。
+# bot 是单线程 getUpdates 长轮询，用模块级变量即可，不存在并发覆盖。
+CUR_THREAD = None
+
+
 def send(chat_id, text, markup=None):
     p = dict(chat_id=chat_id, text=text, parse_mode="HTML")
+    if CUR_THREAD:
+        p["message_thread_id"] = CUR_THREAD
     if markup:
         p["reply_markup"] = markup
     tg("sendMessage", **p)
@@ -3671,9 +4027,13 @@ def main():
                 continue
             for up in r.get("result", []):
                 state["offset"] = up["update_id"] + 1
+                global CUR_THREAD
                 if "message" in up:
+                    CUR_THREAD = up["message"].get("message_thread_id")
                     handle_message(up["message"], state)
                 elif "callback_query" in up:
+                    CUR_THREAD = ((up["callback_query"].get("message") or {})
+                                  .get("message_thread_id"))
                     handle_callback(up["callback_query"], state)
                 save_state(state)
         except Exception as e:
@@ -3804,15 +4164,17 @@ TG_CHAT_ID=$(grep 'TG_CHAT_ID' "$HEALTH_SCRIPT" 2>/dev/null | head -1 | sed "s/.
 if [ -z "$TG_BOT_TOKEN" ] || [ "$TG_BOT_TOKEN" = "请填写" ]; then
     echo "健康告警未配置 TG，跳过"; exit 0
 fi
+# 面板升级用自己的话题，与健康告警分开；空 = 普通群/主话题
+TG_THREAD_ID=""
 
 send_tg() {
-    if [ -n "$2" ]; then
-        curl -s --max-time 20 "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${TG_CHAT_ID}" --data-urlencode "text=$1" --data-urlencode "reply_markup=$2" >/dev/null
-    else
-        curl -s --max-time 20 "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${TG_CHAT_ID}" --data-urlencode "text=$1" >/dev/null
-    fi
+    local msg="$1" markup="${2:-}"
+    local extra=()
+    [ -n "$TG_THREAD_ID" ] && extra+=(--data-urlencode "message_thread_id=${TG_THREAD_ID}")
+    [ -n "$markup" ]       && extra+=(--data-urlencode "reply_markup=${markup}")
+    curl -s --max-time 20 "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+        --data-urlencode "chat_id=${TG_CHAT_ID}" --data-urlencode "text=${msg}" \
+        "${extra[@]}" >/dev/null
 }
 
 panel_healthy() {
@@ -4155,6 +4517,8 @@ menu() {
     echo -e "${CYAN}║${PLAIN}   11. 同步界面美化代码                               ${CYAN}║${PLAIN}"
     echo -e "${CYAN}║${PLAIN}   12. 配置 TG 管理 Bot                               ${CYAN}║${PLAIN}"
     echo -e "${CYAN}║${PLAIN}   13. 生成 Agent 安装命令 (默认关终端/文件/NAT)      ${CYAN}║${PLAIN}"
+    echo -e "${CYAN}║${PLAIN}   14. 配置 TG 群组话题 (5 通道各占一个话题)          ${CYAN}║${PLAIN}"
+    echo -e "${CYAN}║${PLAIN}   15. Agent 加固巡检 (盯住漏加固的机器)              ${CYAN}║${PLAIN}"
     echo -e "${CYAN}║${PLAIN}   0.  退出                                           ${CYAN}║${PLAIN}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${PLAIN}"
     read -p " 请输入选项: " num
@@ -4213,12 +4577,18 @@ menu() {
         13)
             show_agent_install_cmd
             ;;
+        14)
+            manage_tg_topics
+            ;;
+        15)
+            manage_audit
+            ;;
         0)
             echo -e "${GREEN}再见!${PLAIN}"
             exit 0
             ;;
         *)
-            echo -e "${RED}请输入正确数字 [0-13]${PLAIN}"
+            echo -e "${RED}请输入正确数字 [0-15]${PLAIN}"
             sleep 1
             ;;
     esac

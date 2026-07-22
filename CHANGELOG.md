@@ -4,6 +4,41 @@
 
 ---
 
+## [1.1.0] - 2026-07-22
+
+新增 Agent 加固巡检，并将全部推送迁移到 Telegram 话题群 —— 一个群即可承载所有通知，各通道互不干扰。
+
+### 新增
+
+- **Agent 加固巡检（菜单 15）**
+
+  探测各 agent 的 `disable_command_execute` 与 `disable_nat`，发现未加固机器时推送 Telegram 提醒。默认每天 09:30 由 systemd timer 触发，也可在菜单里立即巡检。
+
+  探测原理：`GET /api/v1/server/config/{id}` 会向 agent 下发 `ReportConfig` 任务。未加固的 agent 返回完整配置，可读到两个开关的真实值；已设 `disable_command_execute=true` 的 agent 连回报配置都拒绝，接口返回 `此 Agent 已禁止命令执行` —— 这个拒绝本身即「已加固」的证据。
+
+  几个关键设计：
+
+  - **离线机器一律跳过**。面板的 `ConfigCache` 会把上一次的配置直接返回，对离线机器拿到的是快照而非实时值，据此告警等于凭空捏造。因此先用 `last_active` 过滤，超过 `OFFLINE_SECS` 或为零值的直接跳过
+  - **仅在未加固名单变化时推送**，避免同一批机器天天刷屏
+  - **复用 bot 已有的 PAT**（`nezha:inventory:read,nezha:server:write,nezha:service:write`），不新增任何常驻凭据
+  - 配置接口返回体含 `client_secret` 等凭据，代码只提取两个布尔量，其余不留存、不外发、不写日志
+
+  **能力边界**：只能查出「`disable_command_execute` 未关」的机器。已加固机器的 `disable_nat` 无法远程读取（回报配置被同一个开关挡住），需要 SSH 或重装时经菜单 13 的命令补上。
+
+- **Telegram 话题群支持（菜单 14）**
+
+  健康告警、到期提醒、面板升级、Agent 巡检四个推送通道各自新增 `TG_THREAD_ID`，发送时带上 `message_thread_id`；留空则退回普通群行为，不影响未使用话题的用户。
+
+  菜单 14 统一写入群 Chat ID 与四个话题 ID，写完**逐通道发送一条验证消息**，当场暴露话题 ID 填错或 bot 权限不足，不必等到对应服务真触发才发现。
+
+  TG 管理 Bot 采用另一种方式：回复时原样带回收到的 `message_thread_id`，消息自动落在用户说话的那个话题里，无需配置。
+
+### 变更
+
+- 日志轮转配置新增 `/var/log/nezha_audit.log`
+
+---
+
 ## [1.0.4] - 2026-07-22
 
 面向「纯监控」场景的加固：面板只用于看状态，不需要网页终端、文件管理与 NAT 穿透。
