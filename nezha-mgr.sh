@@ -8,7 +8,7 @@
 # ==============================================================
 
 # 脚本版本（唯一来源，其余位置一律引用此变量，勿再硬编码）
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 
 # 颜色定义
 RED='\033[0;31m'
@@ -2019,6 +2019,7 @@ DISK_INTERVAL     = 60    # 磁盘持续超阈值多少秒后才告警
 NET_IN_THRESHOLD  = 0     # 入站带宽告警阈值 MB/s，0=不启用
 NET_OUT_THRESHOLD = 0     # 出站带宽告警阈值 MB/s，0=不启用
 OFFLINE_SECS      = 15    # 超过多少秒未上报视为离线
+PANEL_RESTART_GRACE = 120 # 面板重启后 last_active 全体归零的宽限秒数，期间不做离线判定
 OFFLINE_ALERT_ENABLED   = True   # 离线/上线告警独立开关
 RESOURCE_ALERT_ENABLED = False  # CPU/内存/磁盘告警独立开关
 OFFLINE_REMINDER_MINS  = [15, 30, 45, 60, 120, 300, 480, 720]  # 持续离线提醒间隔（分钟）
@@ -2030,6 +2031,8 @@ PAT_FILE          = "/opt/nezha/.nezha_pat"   # 只读 PAT（nezha:inventory:rea
 # ==============================
 
 CST = timezone(timedelta(hours=8))
+
+_last_api_fail = 0.0   # 最近一次 API 取数失败的时刻，用于识别面板重启
 
 COUNTRY_CODES = {
     'AD','AE','AF','AG','AL','AM','AO','AR','AT','AU','AZ','BA','BB','BD','BE',
@@ -2125,26 +2128,40 @@ def run_check():
     now_cst = datetime.now(CST)
     time_str = now_cst.strftime("%Y-%m-%d %H:%M:%S")
 
+    global _last_api_fail
     try:
         data = get_data()
     except Exception as e:
+        _last_api_fail = now_ts
         print(f"[{time_str}] API 取数失败: {e}")
         return
 
     state = load_state()
+    orig  = load_state()   # 独立副本，某条告警发送失败时用于回滚该机器的状态
     msgs  = []
 
-    for srv in data.get("servers", []):
+    # 面板 v2.3.0 起，agent 一断连就把 last_active 清零（v2.2.10 会保留最后心跳时间），
+    # 面板重启时同样全体归零。零值本身分不出「这台掉线」还是「面板刚重启」，靠范围区分：
+    # 面板重启 = API 刚从不可用恢复 或 本轮全员归零；其余零值都是这台机器真掉线。
+    servers = [(s, parse_last_active(s.get("last_active", ""))) for s in data.get("servers", [])]
+    zero_n  = sum(1 for _, la in servers if not la)
+    panel_restarting = (now_ts - _last_api_fail) < PANEL_RESTART_GRACE or (servers and zero_n == len(servers))
+
+    for srv, last_act in servers:
         name     = srv.get("name", "unknown")
         s_data   = srv.get("state") or {}
         h_data   = srv.get("host") or {}
         cc       = ((srv.get("geoip") or {}).get("country_code") or "").upper()
-        last_act = parse_last_active(srv.get("last_active", ""))
 
-        # last_active 为空/零值：面板刚重启、还没收到该 agent 心跳，数据不可信。
-        # 跳过本轮，避免每次重启面板把所有服务器误报为「离线」（最后在线显示「未知」）。
+        prev = state.get(name, {})
+        cur  = dict(prev)
+
         if not last_act:
-            continue
+            if panel_restarting:
+                continue                          # 数据不可信，整轮跳过，不动 state
+            last_act = prev.get("last_seen", 0)   # 回退到最后一次已知心跳，照常做 15s 判定
+        else:
+            cur["last_seen"] = last_act
 
         flag = ""
         if cc and len(cc) == 2 and cc in COUNTRY_CODES:
@@ -2160,9 +2177,6 @@ def run_check():
         tcp_cnt  = s_data.get("tcp_conn_count", 0)
         udp_cnt  = s_data.get("udp_conn_count", 0)
 
-        prev = state.get(name, {})
-        cur  = dict(prev)
-
         # ---- 离线 / 上线 ----
         was_online = prev.get("online", True)
         cur["online"] = is_online
@@ -2174,14 +2188,14 @@ def run_check():
 
         # 离线计时追踪（始终执行，与告警开关无关）
         if not is_online and was_online:
-            cur["offline_since"] = last_act
+            cur["offline_since"] = last_act or now_ts
             cur["offline_reminder_idx"] = 0
             cur["offline_reminder_ts"] = now_ts
         elif is_online and not was_online:
             for k in ("offline_since", "offline_reminder_idx", "offline_reminder_ts"):
                 cur.pop(k, None)
         elif not is_online and not was_online and not prev.get("offline_since"):
-            cur["offline_since"] = last_act
+            cur["offline_since"] = last_act or now_ts
             cur["offline_reminder_idx"] = 0
             cur["offline_reminder_ts"] = now_ts
 
@@ -2192,12 +2206,12 @@ def run_check():
                 snap_line = (
                     f"\n📊C:<b><u>{snap['cpu']:.1f}%</u></b> R:<b><u>{snap['mem']:.1f}%</u></b> D:<b><u>{snap['disk']:.1f}%</u></b> 🌐<b><u>{snap['tcp']}/{snap['udp']}</u></b>"
                 ) if snap else ""
-                msgs.append(
+                msgs.append((name,
                     f"❌ <b>服务器已离线</b>\n"
                     f"{label}\n"
                     f"🕐 最后在线:{last_str}"
                     f"{snap_line}"
-                )
+                ))
             elif is_online and not was_online:
                 off_since = prev.get("offline_since", 0)
                 if off_since:
@@ -2215,12 +2229,12 @@ def run_check():
                 res_line = (
                     f"\n📊C:<b><u>{cpu:.1f}%</u></b> R:<b><u>{mem_pct:.1f}%</u></b> D:<b><u>{disk_pct:.1f}%</u></b> 🌐<b><u>{tcp_cnt}/{udp_cnt}</u></b>"
                 )
-                msgs.append(
+                msgs.append((name,
                     f"✅ <b>服务器已恢复上线</b>\n"
                     f"{label}\n"
                     f"🕐 恢复:{time_str}{dur_suffix}"
                     f"{res_line}"
-                )
+                ))
             elif not is_online and not was_online:
                 offline_since = cur.get("offline_since", 0)
                 reminder_idx  = cur.get("offline_reminder_idx", 0)
@@ -2234,11 +2248,11 @@ def run_check():
                         secs = int(now_ts - offline_since)
                         m = secs // 60; h = m // 60; m %= 60
                         dur = (f"{h}小时{m}分钟" if m else f"{h}小时") if h else f"{m}分钟"
-                        msgs.append(
+                        msgs.append((name,
                             f"❌ <b>服务器仍未恢复</b>\n"
                             f"{label}\n"
                             f"⏱ 已离线:<b>{dur}</b>"
-                        )
+                        ))
                         cur["offline_reminder_idx"] = reminder_idx + 1
                         cur["offline_reminder_ts"] = now_ts
 
@@ -2294,29 +2308,32 @@ def run_check():
             parts = "\n".join(
                 f"  {n}: <b>{v:.1f}{u}</b>（阈值 {t}{u}）" for n, v, t, u in alerts
             )
-            msgs.append(
+            msgs.append((name,
                 f"⚠️ <b>服务器资源告警</b>（{time_str}）\n"
                 f"{label}\n{parts}\n"
                 f"📊C:<b><u>{cpu:.1f}%</u></b> R:<b><u>{mem_pct:.1f}%</u></b> D:<b><u>{disk_pct:.1f}%</u></b> 🌐<b><u>{tcp_cnt}/{udp_cnt}</u></b>"
                 + (f" ⇅{net_in:.1f}/{net_out:.1f}MB/s" if NET_IN_THRESHOLD or NET_OUT_THRESHOLD else "")
-            )
+            ))
         if recovers:
-            msgs.append(
+            msgs.append((name,
                 f"✅ <b>资源告警已解除</b>（{time_str}）\n"
                 f"{label}\n"
                 + "  " + " / ".join(recovers) + " 已恢复正常"
-            )
+            ))
 
         state[name] = cur
 
-    save_state(state)
-
-    for msg in msgs:
+    # 先发送再落盘：发送失败的机器回滚状态，下一轮会重新判定并重发，
+    # 否则状态已翻转而消息没发出去，这条告警就被永久吞掉了。
+    for name, msg in msgs:
         try:
             send_tg(msg)
             print(f"[{time_str}] 已发送: {msg[:60]}...")
         except Exception as e:
-            print(f"[{time_str}] 发送失败: {e}")
+            state[name] = orig.get(name, {})
+            print(f"[{time_str}] 发送失败(已回滚状态，下轮重试): {e}")
+
+    save_state(state)
 
     if not msgs:
         print(f"[{time_str}] 检查完成，无告警")
@@ -2490,7 +2507,7 @@ manage_health() {
             sed -i "s|^OFFLINE_SECS      = .*|OFFLINE_SECS      = ${new_offline}|"           "$HEALTH_SCRIPT"
             sed -i "s|^RESOURCE_ALERT_ENABLED = .*|RESOURCE_ALERT_ENABLED = ${new_resource_enabled}|" "$HEALTH_SCRIPT"
             # 保留用户原有的离线告警开关（重新部署会重置为默认 True）
-            [ "$offline_alert_raw" = "False" ] && sed -i 's/^OFFLINE_ALERT_ENABLED = True/OFFLINE_ALERT_ENABLED = False/' "$HEALTH_SCRIPT"
+            [ "$offline_alert_raw" = "False" ] && sed -i "s|^OFFLINE_ALERT_ENABLED   = .*|OFFLINE_ALERT_ENABLED   = False|" "$HEALTH_SCRIPT"
             echo -e "${GREEN}配置已保存${PLAIN}"
 
             _health_service_install
@@ -2562,11 +2579,11 @@ PYTEST
             continue
             ;;
         3)
-            if grep -q 'OFFLINE_ALERT_ENABLED = True' "$HEALTH_SCRIPT"; then
-                sed -i 's/^OFFLINE_ALERT_ENABLED = True/OFFLINE_ALERT_ENABLED = False/' "$HEALTH_SCRIPT"
+            if grep -q '^OFFLINE_ALERT_ENABLED   = True' "$HEALTH_SCRIPT"; then
+                sed -i "s|^OFFLINE_ALERT_ENABLED   = .*|OFFLINE_ALERT_ENABLED   = False|" "$HEALTH_SCRIPT"
                 echo -e "${YELLOW}离线告警已关闭${PLAIN}"
             else
-                sed -i 's/^OFFLINE_ALERT_ENABLED = False/OFFLINE_ALERT_ENABLED = True/' "$HEALTH_SCRIPT"
+                sed -i "s|^OFFLINE_ALERT_ENABLED   = .*|OFFLINE_ALERT_ENABLED   = True|" "$HEALTH_SCRIPT"
                 echo -e "${GREEN}离线告警已开启${PLAIN}"
             fi
             systemctl restart nezha-health 2>/dev/null
