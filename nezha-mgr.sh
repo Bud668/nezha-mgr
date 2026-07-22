@@ -8,7 +8,7 @@
 # ==============================================================
 
 # 脚本版本（唯一来源，其余位置一律引用此变量，勿再硬编码）
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.0.3"
 
 # 颜色定义
 RED='\033[0;31m'
@@ -2409,7 +2409,6 @@ EOF
     # 各服务用 StandardOutput=append: 持有 fd，必须用 copytruncate，否则轮转后仍写旧文件。
     cat > /etc/logrotate.d/nezha << 'EOF'
 /var/log/nezha_health.log /var/log/nezha_notify.log /var/log/nezha_bot.log /var/log/nezha_upgrade.log {
-    daily
     size 20M
     rotate 7
     compress
