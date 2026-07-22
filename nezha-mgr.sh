@@ -8,7 +8,7 @@
 # ==============================================================
 
 # 脚本版本（唯一来源，其余位置一律引用此变量，勿再硬编码）
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.0.2"
 
 # 颜色定义
 RED='\033[0;31m'
@@ -2020,6 +2020,7 @@ NET_IN_THRESHOLD  = 0     # 入站带宽告警阈值 MB/s，0=不启用
 NET_OUT_THRESHOLD = 0     # 出站带宽告警阈值 MB/s，0=不启用
 OFFLINE_SECS      = 15    # 超过多少秒未上报视为离线
 PANEL_RESTART_GRACE = 120 # 面板重启后 last_active 全体归零的宽限秒数，期间不做离线判定
+TG_FAIL_BACKOFF   = 30    # TG 发送失败后的默认退避秒数（429 则以接口返回的 retry_after 为准）
 OFFLINE_ALERT_ENABLED   = True   # 离线/上线告警独立开关
 RESOURCE_ALERT_ENABLED = False  # CPU/内存/磁盘告警独立开关
 OFFLINE_REMINDER_MINS  = [15, 30, 45, 60, 120, 300, 480, 720]  # 持续离线提醒间隔（分钟）
@@ -2032,7 +2033,8 @@ PAT_FILE          = "/opt/nezha/.nezha_pat"   # 只读 PAT（nezha:inventory:rea
 
 CST = timezone(timedelta(hours=8))
 
-_last_api_fail = 0.0   # 最近一次 API 取数失败的时刻，用于识别面板重启
+_last_api_fail  = 0.0   # 最近一次 API 取数失败的时刻，用于识别面板重启
+_tg_pause_until = 0.0   # TG 发送失败/限流后的静默截止时刻
 
 COUNTRY_CODES = {
     'AD','AE','AF','AG','AL','AM','AO','AR','AT','AU','AZ','BA','BB','BD','BE',
@@ -2109,6 +2111,13 @@ def save_state(state):
         pass
 
 
+class TGError(RuntimeError):
+    """发送失败，retry_after 为建议的退避秒数。"""
+    def __init__(self, msg, retry_after=TG_FAIL_BACKOFF):
+        super().__init__(msg)
+        self.retry_after = retry_after
+
+
 def send_tg(message):
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = json.dumps({
@@ -2117,10 +2126,22 @@ def send_tg(message):
         "parse_mode": "HTML"
     }).encode()
     req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        result = json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        # 429 限流：Telegram 在 parameters.retry_after 给出应等待的秒数，必须遵守。
+        # 群组限流约 20 条/分钟，批量掉线时很容易撞上；若无视它按轮询间隔重发，
+        # 只会不断延长限流时间。
+        if e.code == 429:
+            try:
+                body = json.loads(e.read() or b"{}")
+            except Exception:
+                body = {}
+            raise TGError("限流 429", (body.get("parameters") or {}).get("retry_after", TG_FAIL_BACKOFF))
+        raise TGError(f"HTTP {e.code}")
     if not result.get("ok"):
-        raise RuntimeError(f"TG send failed: {result}")
+        raise TGError(f"TG send failed: {result}")
 
 
 def run_check():
@@ -2128,7 +2149,7 @@ def run_check():
     now_cst = datetime.now(CST)
     time_str = now_cst.strftime("%Y-%m-%d %H:%M:%S")
 
-    global _last_api_fail
+    global _last_api_fail, _tg_pause_until
     try:
         data = get_data()
     except Exception as e:
@@ -2326,12 +2347,17 @@ def run_check():
     # 先发送再落盘：发送失败的机器回滚状态，下一轮会重新判定并重发，
     # 否则状态已翻转而消息没发出去，这条告警就被永久吞掉了。
     for name, msg in msgs:
+        if time.time() < _tg_pause_until:
+            state[name] = orig.get(name, {})   # 仍在退避期，整批延后
+            continue
         try:
             send_tg(msg)
             print(f"[{time_str}] 已发送: {msg[:60]}...")
         except Exception as e:
+            wait = getattr(e, "retry_after", TG_FAIL_BACKOFF)
+            _tg_pause_until = time.time() + wait
             state[name] = orig.get(name, {})
-            print(f"[{time_str}] 发送失败(已回滚状态，下轮重试): {e}")
+            print(f"[{time_str}] 发送失败(已回滚状态，{wait}s 后重试): {e}")
 
     save_state(state)
 
@@ -2378,6 +2404,20 @@ StandardError=append:/var/log/nezha_health.log
 
 [Install]
 WantedBy=multi-user.target
+EOF
+    # 健康脚本每 CHECK_INTERVAL 秒写一行心跳，不轮转会无限增长（实测两个月 40MB/89 万行）。
+    # 各服务用 StandardOutput=append: 持有 fd，必须用 copytruncate，否则轮转后仍写旧文件。
+    cat > /etc/logrotate.d/nezha << 'EOF'
+/var/log/nezha_health.log /var/log/nezha_notify.log /var/log/nezha_bot.log /var/log/nezha_upgrade.log {
+    daily
+    size 20M
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
 EOF
     systemctl daemon-reload
     systemctl enable nezha-health
