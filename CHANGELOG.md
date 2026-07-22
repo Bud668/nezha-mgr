@@ -4,6 +4,32 @@
 
 ---
 
+## [1.1.1] - 2026-07-22
+
+### 变更
+
+- **全新安装默认启用 TSDB（服务监控历史时序库），保留 30 天**
+
+  面板 v2.3.0 起支持 TSDB，但 `tsdb.data_path` 为空时处于禁用状态，服务监控历史会全部写入 SQLite 的 `service_histories` 表 —— 而该表**没有任何清理机制**（面板的 `CleanMonitorHistory` 每天 3:30 只清理流量表 `transfers`）。
+
+  实测某面板 31 个服务监控 × 23 台机器、30 秒间隔运行 52 天，该表累积 **4418 万行**，连同两个索引占用 **8.5 GB**，且按约 200 MB/天持续增长，一年将超过 70 GB。
+
+  安装流程中新增 `set_tsdb`，在 `add_default_monitors` **之前**执行 —— 监控一旦创建就开始产生历史，先开 TSDB 可避免数据落进 SQLite。写入路径在面板代码中是二选一的：
+
+  ```go
+  if TSDBEnabled() {
+      TSDBShared.WriteServiceMetrics(...)      // TSDB，按 retention_days 滚动
+  } else {
+      DB.Create(&model.ServiceHistory{...})    // SQLite，无清理
+  }
+  ```
+
+  **数据保护**：面板首次启用 TSDB 时会 `DROP TABLE service_histories` 且不迁移历史数据。因此 `set_tsdb` 在写入配置前会检查该表行数，若已有历史则打印提示并要求确认，不会静默删除。若 `tsdb.data_path` 已配置则直接跳过。
+
+  配置写入兼容三种情形：首启生成的 `tsdb: {}`、已展开的缩进块、以及键完全缺失；替换正则要求后续行带缩进，因此不会影响相邻的顶层键或前置的 `custom_code: |` 多行块。
+
+---
+
 ## [1.1.0] - 2026-07-22
 
 新增 Agent 加固巡检，并将全部推送迁移到 Telegram 话题群 —— 一个群即可承载所有通知，各通道互不干扰。

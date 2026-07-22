@@ -8,7 +8,7 @@
 # ==============================================================
 
 # 脚本版本（唯一来源，其余位置一律引用此变量，勿再硬编码）
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.1.1"
 
 # 颜色定义
 RED='\033[0;31m'
@@ -168,6 +168,8 @@ EOF
     ensure_wal
     # 等待面板就绪：生成健康脚本只读 PAT + 通过 API 写入默认 TCPing 监控
     ensure_health_pat
+    # 先开 TSDB 再建监控：监控一旦开始跑就会产生历史，早开可避免数据落进 SQLite
+    set_tsdb
     add_default_monitors
 
     # 全新安装：把哪吒自动生成的默认 admin 密码替换为强随机密码并打印；登录有效期设为 30 天
@@ -260,6 +262,52 @@ set_jwt_timeout() {
     fi
     systemctl restart nezha-dashboard
     echo -e "${GREEN}✅ 登录有效期已设为 30 天 (jwt_timeout=720)${PLAIN}"
+}
+
+# ==============================================================
+# 启用 TSDB（服务监控历史时序库）。面板 v2.3.0 起支持但默认不开：
+# tsdb.data_path 为空即禁用，监控历史全部写进 SQLite 的 service_histories，
+# 而该表没有任何清理机制（CleanMonitorHistory 只清流量表）。
+# 实测 31 个服务 × 23 台机器跑 52 天 = 4418 万行 / 8.5 GB，且会一直涨下去。
+# 开启后写入改走 TSDB(VictoriaMetrics)，按 retention_days 滚动保留。
+# 注意：面板首次启用时会 DROP 掉 service_histories，历史数据不迁移，
+#       因此这里对已有历史的库先征求确认，避免静默删数据。
+# ==============================================================
+set_tsdb() {
+    local CFG="${DATA_DIR}/config.yaml" DB="${DATA_DIR}/sqlite.db" i=0 rows=0
+    while [ ! -f "$CFG" ] && [ $i -lt 15 ]; do sleep 2; i=$((i+1)); done
+    [ ! -f "$CFG" ] && return
+
+    if grep -qE '^[[:space:]]+data_path:' "$CFG"; then
+        echo -e "${GREEN}TSDB 已启用，跳过${PLAIN}"
+        return
+    fi
+
+    if [ -f "$DB" ]; then
+        rows=$(sqlite3 "$DB" "select count(*) from service_histories;" 2>/dev/null || echo 0)
+    fi
+    if [ "${rows:-0}" -gt 0 ]; then
+        echo -e "${YELLOW}⚠ 检测到 service_histories 已有 ${rows} 行历史监控数据${PLAIN}"
+        echo -e "${YELLOW}  启用 TSDB 会让面板删除这张表，历史曲线清零（不影响掉线告警）${PLAIN}"
+        read -r -p "  仍要启用 TSDB？[y/N]: " yn
+        case "$yn" in [Yy]*) ;; *) echo -e "${CYAN}已跳过 TSDB${PLAIN}"; return ;; esac
+    fi
+
+    python3 - "$CFG" "${DATA_DIR}/tsdb" <<'PY'
+import re, sys
+cfg, path = sys.argv[1], sys.argv[2]
+s = open(cfg, encoding="utf-8").read()
+block = "tsdb:\n  data_path: %s\n  retention_days: 30" % path
+if re.search(r'^tsdb:', s, re.M):
+    # 首启生成的是 "tsdb: {}"；若已展开成缩进块则连同缩进行一起替换。
+    # [ \t]+\S 要求有缩进，因此不会吃掉后面的顶层键。
+    s = re.sub(r'^tsdb:.*(?:\n[ \t]+\S.*)*', block, s, count=1, flags=re.M)
+else:
+    s = s.rstrip("\n") + "\n" + block + "\n"
+open(cfg, "w", encoding="utf-8").write(s)
+PY
+    systemctl restart nezha-dashboard
+    echo -e "${GREEN}✅ 已启用 TSDB (保留 30 天)，服务监控历史不再无限堆积${PLAIN}"
 }
 
 # ==============================================================
